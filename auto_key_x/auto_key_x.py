@@ -13,13 +13,13 @@
   auto_key_x.py    啟動入口
   x_settings.py    時間參數、快捷鍵說明、視窗記憶（x_window.json／Mac 為 x_window_mac.json）
   x_controller.py  主控制器：快捷鍵事件、視窗鎖定/監看、模式1、補技能
-  沿用 auto_key（只讀不改）：platforms/、alert_detect.py、tg_notify.py（TG 設定讀 auto_key/tg_config.json）
+  沿用 auto_key（只讀不改）：platforms/、alert_detect.py、tg_notify.py（都放在本資料夾；TG 設定讀本資料夾的 tg_config.json）
 """
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(os.path.dirname(HERE), "auto_key"))
+# 共用模組（platforms、alert_detect、tg_notify…）和本檔放在同一個資料夾，不需要另外加路徑。
 
 import platforms  # noqa: E402
 import x_settings  # noqa: E402

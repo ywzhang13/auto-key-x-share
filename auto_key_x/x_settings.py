@@ -23,7 +23,6 @@ AUTO_STOP_SECONDS = 72000
 GAME_KEYS = frozenset(("left", "right", "x", "pgup", "insert", "home"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AUTO_KEY_DIR = os.path.join(os.path.dirname(BASE_DIR), "auto_key")
 # 和 auto_key 分開存，不會互相覆蓋；Mac 另存 _mac（兩台視窗不同）。
 WINDOW_SETTINGS_FILE = os.path.join(
     BASE_DIR, f"x_window{'_mac' if sys.platform == 'darwin' else ''}.json")

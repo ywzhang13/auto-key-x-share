@@ -1,13 +1,14 @@
 auto_key_x 使用說明（Windows）
 
-1. 安裝 Python 3.10 以上（安裝時勾選 Add Python to PATH）。
-2. 開「命令提示字元」，安裝套件：
+整個程式都在 auto_key_x 資料夾裡，只要這一個資料夾就能執行，可以放在任何位置。
+
+1. 安裝 Python 3.10 以上（安裝時勾選 Add python.exe to PATH）。
+2. 開「命令提示字元」，安裝套件（只要做一次）：
    py -m pip install pyautogui pillow opencv-python numpy pynput requests
-3. 進到這個資料夾後啟動：
-   cd auto_key_x_package
-   python auto_key_x\auto_key_x.py
+3. 進到 auto_key_x 資料夾後啟動，例如放在桌面：
+   cd %USERPROFILE%\Desktop\auto_key_x
+   python auto_key_x.py
 4. 快捷鍵：F1 開始／F2 暫停／F3 結束／F4 手動換邊／F5 鎖定遊戲視窗／F6 改回整個螢幕／F7 監看開關／F8 辨識分數／F9 TG 測試。
    第一次使用請先點一下遊戲視窗，再按 F5 鎖定。
-5. TG 通知（可選）：把 auto_key\tg_config.example.json 複製成 auto_key\tg_config.json，填入你自己的 bot_token 和 chat_id。
-
-注意：資料夾結構不要改，auto_key_x 會用到旁邊 auto_key 資料夾裡的程式。
+   如果遊戲是用系統管理員身分開的，命令提示字元也要「以系統管理員身分執行」。
+5. TG 通知（可選）：把 auto_key_x\tg_config.example.json 複製成 auto_key_x\tg_config.json，填入你自己的 bot_token 和 chat_id，重新啟動後按 F9 測試。
