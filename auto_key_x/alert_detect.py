@@ -12,9 +12,16 @@ from alert_templates import (
 )
 from tg_notify import send_telegram, TG_ALERT_REPEAT_INTERVAL, TG_CONFIGURED
 
-ALERT_SCAN_SECONDS = 0.12  # 第一階段很短，縮短輪詢間隔；實際仍受截圖/比對耗時限制
-PREP_ALERT_THRESHOLD = 0.78  # 第一階段：小型、半透明提示使用較寬鬆門檻
-GAME_ALERT_THRESHOLD = 0.90  # 第二階段：中央畫面維持嚴格門檻
+ALERT_SCAN_SECONDS = 0.22  # 每輪間隔：準備畫面只顯示 1～2 秒，每輪都看；最慢 0.22 秒＋截圖比對約 0.03 秒，留空間給系統排程延遲
+SLOW_SCAN_SECONDS = 1.0    # 輸入驗證、第二階段會停留較久，每秒看一次；結果沿用到下次檢查
+CURSE_SCAN_SECONDS = 3.0   # 詛咒橫幅會一直顯示到解除，每 3 秒看一次
+PREP_ALERT_THRESHOLD = 0.78  # 第一階段：準備面板標題「準備尋找透明圖形」
+GAME_ALERT_THRESHOLD = 0.90  # 第二階段：上方標題「尋找透明圖形」
+# 面板位置由畫面找出來；標題文字的寬度直接在面板頂端量（實機截圖量得的版面比例）：
+PREP_TITLE_HEIGHT = 0.18   # 準備面板：標題在面板最上面這個比例的高度內
+STAGE2_BAR_ASPECT = (6.0, 20.0)  # 第二階段：上方深灰標題列的寬 ÷ 高（實測約 12.7；背景深灰相連時會變矮胖）
+DETECT_WIDTH = 640         # 找面板時先把畫面縮到這個寬度（只用來找位置，比對標題用原圖）
+PREP_AREA_START = 0.35     # 準備面板出現在遊戲視窗右下：只看右邊、下面 65% 的範圍（與舊版相同）
 CURSE_ALERT_THRESHOLD = 0.82  # 舊樣式詛咒橫幅（深灰底灰白字）：完整兩行固定文字的灰階比對
 CURSE_PURPLE_THRESHOLD = 0.65  # 新樣式詛咒橫幅（紫框紫字）：紫色程度比對（實測詛咒 ≥0.85、一般畫面 ≤0.44）
 CURSE_PURPLE_TEXT_WIDTH = 363.0  # 新樣式範本寬度（像素）
@@ -25,52 +32,34 @@ VERIFY_BOX_WIDTH = 324.0      # Check 範本取樣時，白色輸入框的寬度
 VERIFY_RED_MIN_COVERAGE = 0.30  # 輸入框上方紅色警告字所在那一條，至少要有這個比例的欄位出現紅色
 _CHECK_TEMPLATE = None
 ALERT_CLEAR_SECONDS = 5.0
-_TEMPLATE_CACHE = None
+_TITLE_ENTRIES = {}
+_LAST_CYCLE = {}  # 監看執行緒最近一輪各項偵測的耗時（毫秒），F8 報告顯示
 
 
-def load_title_templates():
-    global _TEMPLATE_CACHE
-    if _TEMPLATE_CACHE is None:
-        import base64
-        import cv2
-        import numpy as np
-        templates = []
-        # 第一階段與第二階段分開辨識；第二階段標題優先，避免短暫畫面漏掉。
-        sources = (
-            ("第二階段實際標題A", ALERT_GAME_TITLE_REAL_PNG),
-            ("第二階段實際標題B", ALERT_GAME_TITLE_REAL_PNG_2),
-            ("第二階段標題", ALERT_GAME_TITLE_PNG),
-            ("準備畫面清晰標題A", ALERT_PREP_TITLE_CLEAR_PNG_A),
-            ("準備畫面清晰標題B", ALERT_PREP_TITLE_CLEAR_PNG_B),
-            ("準備畫面實際標題", ALERT_PREP_TITLE_REAL_PNG),
-            ("準備畫面標題A", ALERT_TITLE_PNG_2),
-            ("準備畫面標題B", ALERT_TITLE_PNG),
-        )
-        game_scales = [1.0, 0.95, 1.05, 0.9, 1.1, 0.8, 1.2, 1.25, 1.5, 0.7]
-        # 第一階段提示較小，且視窗模式大小可能改變，因此使用更密的縮放比例。
-        prep_scales = [value / 100 for value in range(50, 151, 5)]
-        for name, encoded in sources:
-            scales = prep_scales if name.startswith("準備畫面") else game_scales
-            for scale in scales:
-                original = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-                template = cv2.resize(original, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-                templates.append((name, template))
-        _TEMPLATE_CACHE = templates
-    return _TEMPLATE_CACHE
+# 準備畫面（第一階段）與第二階段的標題範本：白字、深灰底。
+TITLE_SOURCES = (
+    ("第二階段實際標題A", ALERT_GAME_TITLE_REAL_PNG),
+    ("第二階段實際標題B", ALERT_GAME_TITLE_REAL_PNG_2),
+    ("第二階段標題", ALERT_GAME_TITLE_PNG),
+    ("準備畫面清晰標題A", ALERT_PREP_TITLE_CLEAR_PNG_A),
+    ("準備畫面清晰標題B", ALERT_PREP_TITLE_CLEAR_PNG_B),
+    ("準備畫面實際標題", ALERT_PREP_TITLE_REAL_PNG),
+    ("準備畫面標題A", ALERT_TITLE_PNG_2),
+    ("準備畫面標題B", ALERT_TITLE_PNG),
+)
 
 
-def center_alert_area(image):
-    """第二階段固定出現在畫面中央。"""
+def prep_region(region):
+    """遊戲視窗 (x, y, 寬, 高) → 準備面板會出現的右下角範圍。"""
+    x, y, width, height = region
+    dx, dy = int(width * PREP_AREA_START), int(height * PREP_AREA_START)
+    return (x + dx, y + dy, width - dx, height - dy)
+
+
+def prep_area(image):
+    """整張截圖 → 準備面板會出現的右下角。"""
     width, height = image.size
-    margin_x = int(width * 0.15)
-    margin_y = int(height * 0.15)
-    return image.crop((margin_x, margin_y, width - margin_x, height - margin_y))
-
-
-def prepare_alert_area(image):
-    """第一階段大約位於遊戲視窗右下；保留較寬範圍容許位置偏差。"""
-    width, height = image.size
-    return image.crop((int(width * 0.35), int(height * 0.35), width, height))
+    return image.crop((int(width * PREP_AREA_START), int(height * PREP_AREA_START), width, height))
 
 
 def curse_alert_area(image):
@@ -137,10 +126,13 @@ def verification_dialog_scores(image):
 
 
 def _purple_mask(rgb):
-    """明顯偏紫（藍、紅都比綠高）的像素；新樣式橫幅的外框、文字、鎖頭都是這個顏色。"""
+    """明顯偏紫（藍、紅都比綠高）的像素；新樣式橫幅的外框、文字、鎖頭都是這個顏色。
+    用 OpenCV 的飽和減法（負數變 0），結果與逐像素相減相同，但快很多。"""
+    import cv2
     import numpy as np
-    r, g, b = (rgb[..., index].astype(np.int16) for index in range(3))
-    return (((b - g) >= 50) & ((r - g) >= 25) & (b >= 120)).astype(np.uint8) * 255
+    red, green, blue = cv2.split(np.ascontiguousarray(rgb))
+    mask = (cv2.subtract(blue, green) >= 50) & (cv2.subtract(red, green) >= 25) & (blue >= 120)
+    return mask.astype(np.uint8) * 255
 
 
 def _purpleness(rgb):
@@ -242,61 +234,185 @@ def curse_scores(image):
     return details, old, CURSE_ALERT_THRESHOLD
 
 
-def title_match_scores(image, full=False, allowed_prefixes=None, threshold=None):
-    """回傳各辨識特徵的最高分，以及所有特徵中的最高分。"""
+def _text_box(template):
+    """範本裡白字的範圍 (x, y, 寬, 高)。"""
+    import numpy as np
+    ys, xs = np.nonzero(template >= 170)
+    return int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+
+
+def load_title_templates(prefix):
+    """回傳 [(名稱, 範本, 文字寬)]；prefix 是「準備畫面」或「第二階段」。"""
+    if prefix not in _TITLE_ENTRIES:
+        import base64
+        import cv2
+        import numpy as np
+        entries = []
+        for name, encoded in TITLE_SOURCES:
+            if name.startswith(prefix):
+                template = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                entries.append((name, template, _text_box(template)[2]))
+        _TITLE_ENTRIES[prefix] = entries
+    return _TITLE_ENTRIES[prefix]
+
+
+def _components(mask, shrink, close):
+    """回傳遮罩裡各塊的 (x, y, 寬, 高, 填滿比例)，座標已換回原圖。"""
     import cv2
     import numpy as np
-    if threshold is None:
-        threshold = GAME_ALERT_THRESHOLD
-    frame = np.asarray(image.convert("L"))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+    return [(int(x / shrink), int(y / shrink), int(w / shrink), int(h / shrink), area / float(w * h))
+            for x, y, w, h, area in (stats[index] for index in range(1, count))]
+
+
+def _shrunk_rgb(image):
+    import cv2
+    import numpy as np
+    rgb = np.asarray(image.convert("RGB"))
+    shrink = min(1.0, DETECT_WIDTH / float(rgb.shape[1]))
+    small = cv2.resize(rgb, None, fx=shrink, fy=shrink, interpolation=cv2.INTER_LINEAR) if shrink < 1 else rgb
+    return rgb, np.ascontiguousarray(small), shrink
+
+
+def _panel_gray(rgb):
+    """遊戲提示面板的深灰色（約 44～52，三色幾乎一樣）；用 OpenCV 運算，比 numpy 快。"""
+    import cv2
+    import numpy as np
+    rgb = np.ascontiguousarray(rgb)
+    red, green, blue = cv2.split(rgb)
+    spread = cv2.max(cv2.max(cv2.absdiff(red, green), cv2.absdiff(green, blue)), cv2.absdiff(red, blue))
+    in_range = cv2.inRange(rgb, (38, 38, 38), (60, 60, 60))
+    return ((in_range > 0) & (spread <= 8)).astype(np.uint8)
+
+
+def _title_extent(rgb, box):
+    """在深灰標題列 box=(x1, y1, x2, y2) 裡量白字標題的左右範圍；回傳 (左, 右) 或 None。"""
+    import numpy as np
+    x1, y1, x2, y2 = (max(0, int(value)) for value in box)
+    strip = rgb[y1:y2, x1:x2]
+    if strip.size == 0:
+        return None
+    import cv2
+    # 只算面板裡的白點（排除框外上下左右的背景）：那一列、那一欄都大半是面板深灰，
+    # 而且附近有面板深灰（範圍約字高，字放大後筆畫變粗也算得到）。
+    panel = _panel_gray(strip)
+    inside_rows = panel.mean(axis=1, keepdims=True) >= 0.5
+    if not inside_rows.any():
+        return None
+    inside_columns = panel[inside_rows[:, 0]].mean(axis=0) >= 0.4  # 欄的比例只看面板裡的列
+    window = max(9, strip.shape[0] // 3) | 1
+    near_panel = cv2.blur(panel.astype(np.float32), (window, window)) >= 0.3
+    bright = strip.min(axis=2) >= 170  # 與範本量字寬同一門檻
+    columns = (bright & near_panel & inside_rows).any(axis=0) & inside_columns
+    xs = np.nonzero(columns)[0]
+    if len(xs) == 0:
+        return None
+    gap = max(4, int((x2 - x1) * 0.04))                  # 字與字之間的空隙不算斷開
+    runs, start = [], xs[0]
+    for previous, current in zip(xs, xs[1:]):
+        if current - previous > gap:
+            runs.append((start, previous))
+            start = current
+    runs.append((start, xs[-1]))
+    left, right = max(runs, key=lambda run: run[1] - run[0])
+    return x1 + int(left), x1 + int(right) + 1
+
+
+def _match_title(gray, rgb, box, prefix, threshold):
+    """量出 box 裡標題的寬度，把該組標題範本縮放到同寬（±3%）在附近比對；回傳 {名稱: 最高分}。"""
+    import cv2
+    extent = _title_extent(rgb, box)
+    if extent is None or extent[1] - extent[0] < 20:
+        return {}
+    text_left, text_right = extent
+    text_width = text_right - text_left
+    _, y1, _, y2 = (max(0, int(value)) for value in box)
+    pad = int(text_width * 0.2) + 4
+    x1 = max(0, text_left - pad)
+    area = gray[y1:y2, x1:text_right + pad]
     details = {}
-    for name, template in load_title_templates():
-        if allowed_prefixes and not name.startswith(allowed_prefixes):
+    for name, template, template_width in load_title_templates(prefix):
+        for factor in (1.0, 0.97, 1.03):
+            scale = text_width * factor / template_width
+            sized = cv2.resize(template, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+            if sized.shape[0] > area.shape[0] or sized.shape[1] > area.shape[1] or min(sized.shape) < 4:
+                continue
+            score = float(cv2.matchTemplate(area, sized, cv2.TM_CCOEFF_NORMED).max())
+            details[name] = max(details.get(name, 0.0), score)
+            if threshold is not None and score >= threshold:
+                return details
+    return details
+
+
+def prep_panel_scores(image, threshold=PREP_ALERT_THRESHOLD):
+    """第一階段：整個畫面找「近乎正方形的深灰面板」，再比對面板頂端的標題「準備尋找透明圖形」。"""
+    import cv2
+    rgb, small, shrink = _shrunk_rgb(image)
+    gray = None
+    details = {}
+    for x, y, w, h, fill in _components(_panel_gray(small), shrink, 5):
+        if w < 120 or not 0.75 <= h / float(w) <= 1.3 or fill < 0.6:
             continue
-        h, w = template.shape
-        if h > frame.shape[0] or w > frame.shape[1]:
-            continue
-        scores = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-        _, maximum, _, _ = cv2.minMaxLoc(scores)
-        details[name] = max(details.get(name, 0.0), float(maximum))
-        if not full and details[name] >= threshold:
-            return details, details[name]
+        if gray is None:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        found = _match_title(gray, rgb, (x, y, x + w, y + h * PREP_TITLE_HEIGHT), "準備畫面", threshold)
+        for name, score in found.items():
+            details[name] = max(details.get(name, 0.0), score)
+        if threshold is not None and max(details.values(), default=0.0) >= threshold:
+            break
     return details, max(details.values(), default=0.0)
 
 
-def title_match_score(image):
-    """相容既有監看流程，只回傳最高分。"""
-    return title_match_scores(center_alert_area(image), threshold=GAME_ALERT_THRESHOLD)[1]
+def stage2_scores(image, threshold=GAME_ALERT_THRESHOLD):
+    """第二階段：整個畫面找「又寬又扁的深灰標題列、正下方是金色紋理」，再比對標題「尋找透明圖形」。
+    不看中間的圖形（星星、三角形、圓形、正方形都可能）。"""
+    import cv2
+    rgb, small, shrink = _shrunk_rgb(image)
+    red, green, blue = cv2.split(small)
+    red_green, green_blue = cv2.subtract(red, green), cv2.subtract(green, blue)  # 小於 0 時為 0
+    # 金色紋理：R 比 G 高 10～50、G 比 B 高 25～80（夕陽、橘紅色背景的 R−G 更大，不算）。
+    gold = ((red_green >= 10) & (red_green <= 50) & (green_blue >= 25) & (green_blue <= 80) & (red >= 90))
+    gray = None
+    details = {}
+    for x, y, w, h, fill in _components(_panel_gray(small), shrink, 3):
+        if w < 150 or not STAGE2_BAR_ASPECT[0] <= w / float(h) <= STAGE2_BAR_ASPECT[1] or fill < 0.55:
+            continue
+        sx1, sx2 = int(x * shrink), int((x + w) * shrink)
+        sy1, sy2 = int((y + h) * shrink), int((y + 3 * h) * shrink)
+        below = gold[sy1:sy2, sx1:sx2]
+        if below.size == 0 or below.mean() < 0.5:
+            continue  # 標題列正下方不是金色紋理
+        if gray is None:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        found = _match_title(gray, rgb, (x, y, x + w, y + h), "第二階段", threshold)
+        for name, score in found.items():
+            details[name] = max(details.get(name, 0.0), score)
+        if threshold is not None and max(details.values(), default=0.0) >= threshold:
+            break
+    return details, max(details.values(), default=0.0)
+
+
+def _timed(timings, label, function, *args):
+    started = time.perf_counter()
+    result = function(*args)
+    timings[label] = (time.perf_counter() - started) * 1000
+    return result
+
+
+def _scores_text(details):
+    return "、".join(f"{name}={value:.3f}" for name, value in
+                    sorted(details.items(), key=lambda item: item[1], reverse=True)) or "沒有找到面板"
 
 
 def alert_score_report(frame):
-    """F8：回傳各類警告的辨識分數文字（只顯示，不傳 TG）。"""
-    verify_details, verify_score = verification_dialog_scores(frame)
-    curse_details, curse_score, curse_threshold = curse_scores(frame)
-    prepare_details, prepare_score = title_match_scores(
-        prepare_alert_area(frame),
-        full=True,
-        allowed_prefixes=("準備畫面",),
-        threshold=PREP_ALERT_THRESHOLD,
-    )
-    game_details, game_score = title_match_scores(
-        center_alert_area(frame),
-        full=True,
-        allowed_prefixes=("第二階段",),
-        threshold=GAME_ALERT_THRESHOLD,
-    )
-    prepare_text = "、".join(
-        f"{name}={value:.3f}"
-        for name, value in sorted(
-            prepare_details.items(), key=lambda item: item[1], reverse=True
-        )
-    )
-    game_text = "、".join(
-        f"{name}={value:.3f}"
-        for name, value in sorted(
-            game_details.items(), key=lambda item: item[1], reverse=True
-        )
-    )
+    """F8：回傳各類警告的辨識分數與耗時（只顯示，不傳 TG）。"""
+    timings = {}
+    verify_details, verify_score = _timed(timings, "輸入驗證", verification_dialog_scores, frame)
+    curse_details, curse_score, curse_threshold = _timed(timings, "詛咒", curse_scores, frame)
+    prepare_details, prepare_score = _timed(timings, "準備畫面", prep_panel_scores, prep_area(frame), None)
+    game_details, game_score = _timed(timings, "第二階段", stage2_scores, frame, None)
     curse_text = (f"新樣式（整個畫面，紫字）={curse_details['詛咒新樣式']:.3f}、"
                   f"舊樣式（上方中央，灰字）={curse_details['詛咒舊樣式']:.3f}")
     verify_text = (
@@ -304,16 +420,24 @@ def alert_score_report(frame):
         f"最像的一個 Check={verify_details['輸入驗證Check']:.3f}、"
         f"紅字覆蓋={verify_details['輸入驗證紅字']:.2f}（需≥{VERIFY_RED_MIN_COVERAGE}）"
     )
-    return (
-        f"整個畫面輸入驗證視窗：{verify_text}；分數={verify_score:.3f}\n"
-        f"詛咒畫面：{curse_text}；分數={curse_score:.3f}（門檻 {curse_threshold}）\n"
-        f"右下區域第一階段：{prepare_text}；最高={prepare_score:.3f}\n"
-        f"中央第二階段：{game_text}；最高={game_score:.3f}\n"
+    timing_text = "、".join(f"{label} {value:.0f}ms" for label, value in timings.items())
+    lines = [
+        f"整個畫面輸入驗證視窗：{verify_text}；分數={verify_score:.3f}",
+        f"詛咒畫面：{curse_text}；分數={curse_score:.3f}（門檻 {curse_threshold}）",
+        f"第一階段準備面板（視窗右下角找深灰面板）：{_scores_text(prepare_details)}；最高={prepare_score:.3f}",
+        f"第二階段（整個畫面找金色區＋標題列）：{_scores_text(game_details)}；最高={game_score:.3f}",
         f"輸入驗證門檻={VERIFY_ALERT_THRESHOLD}；"
         f"詛咒畫面門檻=新樣式 {CURSE_PURPLE_THRESHOLD}／舊樣式 {CURSE_ALERT_THRESHOLD}；"
-        f"第一階段門檻={PREP_ALERT_THRESHOLD}；"
-        f"第二階段門檻={GAME_ALERT_THRESHOLD}；F8 不傳送 TG"
-    )
+        f"第一階段門檻={PREP_ALERT_THRESHOLD}；第二階段門檻={GAME_ALERT_THRESHOLD}；F8 不傳送 TG",
+        f"這次報告各項偵測耗時：{timing_text}",
+    ]
+    if _LAST_CYCLE:
+        lines.append(
+            f"監看中每輪耗時：截圖 {_LAST_CYCLE.get('截圖', 0):.0f}ms＋準備畫面 {_LAST_CYCLE.get('準備畫面', 0):.0f}ms"
+            f"（每 {ALERT_SCAN_SECONDS} 秒）；輸入驗證 {_LAST_CYCLE.get('輸入驗證', 0):.0f}ms、"
+            f"第二階段 {_LAST_CYCLE.get('第二階段', 0):.0f}ms（每 {SLOW_SCAN_SECONDS:g} 秒）；"
+            f"詛咒 {_LAST_CYCLE.get('詛咒', 0):.0f}ms（每 {CURSE_SCAN_SECONDS:g} 秒）")
+    return "\n".join(lines)
 
 class AlertLatch:
     def __init__(self):
@@ -377,7 +501,8 @@ class ScreenAlert:
     def start(self, region):
         if self.thread is not None and self.thread.is_alive():
             raise ValueError("監看已開啟")
-        load_title_templates()  # 缺套件時在主執行緒顯示錯誤
+        load_title_templates("準備畫面")  # 缺套件時在主執行緒顯示錯誤
+        load_title_templates("第二階段")
         load_check_template()
         load_curse_templates()
         self.region = region
@@ -394,58 +519,65 @@ class ScreenAlert:
         self.present.clear()
 
     def loop(self):
+        slow = curse = None
+        next_slow = next_curse = 0.0
         while not self.stop_event.is_set():
             cycle_started = time.monotonic()
             try:
+                timings = {}
                 region = self.region() if callable(self.region) else self.region
-                frame = self.gui.screenshot(region=region)
+                full_scan = slow is None or curse is None or cycle_started >= min(next_slow, next_curse)
+                if full_scan:
+                    frame = _timed(timings, "截圖", self.gui.screenshot, region)
+                    prepare_area = prep_area(frame)
+                else:
+                    # 只看準備面板的輪次：只截右下角，截圖與比對都省一半以上。
+                    prepare_area = _timed(timings, "截圖", self.gui.screenshot, prep_region(region))
+                # 第一階段準備面板只顯示 1～2 秒：每輪截圖後第一個看，從出現到暫停 ≤0.3 秒。
+                prepare_details, prepare_score = _timed(timings, "準備畫面", prep_panel_scores, prepare_area)
+                if slow is None or cycle_started >= next_slow:
+                    # 輸入驗證、第二階段會停留較久：每秒看一次，結果沿用到下次檢查。
+                    next_slow = cycle_started + SLOW_SCAN_SECONDS
+                    slow = (_timed(timings, "輸入驗證", verification_dialog_scores, frame),
+                            _timed(timings, "第二階段", stage2_scores, frame))
+                if curse is None or cycle_started >= next_curse:
+                    next_curse = cycle_started + CURSE_SCAN_SECONDS
+                    curse = _timed(timings, "詛咒", curse_scores, frame)
+                (verify_details, verify_score), (game_details, game_score) = slow
+                curse_details, curse_score, curse_threshold = curse
 
-                # 輸入驗證會持續顯示、位置不固定：在整個畫面找輸入框＋Check＋紅字，不分析或代填答案。
-                verify_details, verify_score = verification_dialog_scores(frame)
+                # 輸入驗證：在整個畫面找輸入框＋Check＋紅字，不分析或代填答案。
                 if verify_score >= VERIFY_ALERT_THRESHOLD:
                     details = verify_details
                     score = verify_score
                     threshold = VERIFY_ALERT_THRESHOLD
                     stage = "中央輸入驗證：怪物名稱或狀態"
                     self.phase = "等待輸入驗證消失"
-                else:
+                elif curse_score >= curse_threshold:
                     # 詛咒橫幅：新樣式（紫字）在整個畫面找，舊樣式（灰字）在上方中央找。
-                    curse_details, curse_score, curse_threshold = curse_scores(frame)
-                    if curse_score >= curse_threshold:
-                        details = {**verify_details, **curse_details}
-                        score = curse_score
-                        threshold = curse_threshold
-                        stage = "詛咒畫面：解除詛咒提示"
-                        self.phase = "等待詛咒提示消失"
-                    else:
-                        # 第一階段提示框很小且短暫，掃較小的右下範圍。
-                        prepare_details, prepare_score = title_match_scores(
-                            prepare_alert_area(frame),
-                            allowed_prefixes=("準備畫面",),
-                            threshold=PREP_ALERT_THRESHOLD,
-                        )
-                        if prepare_score >= PREP_ALERT_THRESHOLD:
-                            details = {**verify_details, **curse_details, **prepare_details}
-                            score = prepare_score
-                            threshold = PREP_ALERT_THRESHOLD
-                            stage = "第一階段：遊戲視窗內準備畫面"
-                            self.phase = "等待中央第二階段"
-                        else:
-                            # 即使第一階段太短而漏掉，中央第二階段仍可獨立補抓。
-                            game_details, game_score = title_match_scores(
-                                center_alert_area(frame),
-                                allowed_prefixes=("第二階段",),
-                                threshold=GAME_ALERT_THRESHOLD,
-                            )
-                            details = {
-                                **verify_details, **curse_details,
-                                **prepare_details, **game_details,
-                            }
-                            score = game_score
-                            threshold = GAME_ALERT_THRESHOLD
-                            stage = "第二階段：中央小遊戲"
-                            if game_score >= GAME_ALERT_THRESHOLD:
-                                self.phase = "等待提示消失"
+                    details = {**verify_details, **curse_details}
+                    score = curse_score
+                    threshold = curse_threshold
+                    stage = "詛咒畫面：解除詛咒提示"
+                    self.phase = "等待詛咒提示消失"
+                elif prepare_score >= PREP_ALERT_THRESHOLD:
+                    details = {**verify_details, **curse_details, **prepare_details}
+                    score = prepare_score
+                    threshold = PREP_ALERT_THRESHOLD
+                    stage = "第一階段：遊戲視窗內準備畫面"
+                    self.phase = "等待中央第二階段"
+                else:
+                    # 即使第一階段太短而漏掉，第二階段仍可獨立補抓。
+                    details = {
+                        **verify_details, **curse_details,
+                        **prepare_details, **game_details,
+                    }
+                    score = game_score
+                    threshold = GAME_ALERT_THRESHOLD
+                    stage = "第二階段：中央小遊戲"
+                    if game_score >= GAME_ALERT_THRESHOLD:
+                        self.phase = "等待提示消失"
+                _LAST_CYCLE.update(timings)
                 self.last_details = details
                 self.last_score = score
                 self.scan_count += 1

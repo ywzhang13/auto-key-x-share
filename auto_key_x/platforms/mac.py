@@ -77,6 +77,15 @@ REQUIRED_PACKAGES_HINT = (
 )
 
 
+def _autorelease_pool():
+    try:
+        import objc
+        return objc.autorelease_pool()
+    except ImportError:  # 測試環境（假 Quartz）沒有 pyobjc
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def enable_dpi_awareness():
     pass  # macOS 不需要；Retina 由 MacGui.screenshot 縮回「點」的大小
 
@@ -336,15 +345,25 @@ class MacGui:
         q = self.q
         x, y, w, h = region if region is not None else (0, 0) + self.size()
         w, h = int(round(w)), int(round(h))
-        image = q.CGWindowListCreateImage(q.CGRectMake(x, y, w, h), q.kCGWindowListOptionOnScreenOnly,
-                                          q.kCGNullWindowID, q.kCGWindowImageDefault)
-        if image is None:
-            raise ValueError("截圖失敗，請確認螢幕錄製權限已開啟")
-        if q.CGImageGetBitsPerPixel(image) != 32:
-            raise ValueError("截圖格式不支援")
-        pw, ph = q.CGImageGetWidth(image), q.CGImageGetHeight(image)
-        data = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
-        frame = Image.frombuffer("RGB", (pw, ph), data, "raw", "BGRX", q.CGImageGetBytesPerRow(image), 1)
+        # 背景執行緒每秒截好幾次：要在 autorelease pool 裡做完，否則 Quartz 物件不會被釋放。
+        with _autorelease_pool():
+            image = q.CGWindowListCreateImage(q.CGRectMake(x, y, w, h), q.kCGWindowListOptionOnScreenOnly,
+                                              q.kCGNullWindowID, q.kCGWindowImageDefault)
+            if image is None:
+                raise ValueError("截圖失敗，請確認螢幕錄製權限已開啟")
+            if q.CGImageGetBitsPerPixel(image) != 32:
+                raise ValueError("截圖格式不支援")
+            pw, ph = q.CGImageGetWidth(image), q.CGImageGetHeight(image)
+            row_bytes = q.CGImageGetBytesPerRow(image)
+            cf_data = q.CGDataProviderCopyData(q.CGImageGetDataProvider(image))
+            # 不能用 bytes(cf_data)：pyobjc 每次都會漏掉整張圖的記憶體（實測每張約 7MB，久了會到幾十 GB）。
+            view = memoryview(cf_data)
+            try:
+                data = view.tobytes()
+            finally:
+                view.release()
+            del cf_data, image
+        frame = Image.frombuffer("RGB", (pw, ph), data, "raw", "BGRX", row_bytes, 1)
         return frame if (pw, ph) == (w, h) else frame.resize((w, h), Image.BILINEAR)
 
 
