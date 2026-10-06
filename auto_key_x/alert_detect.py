@@ -276,13 +276,13 @@ def _shrunk_rgb(image):
 
 
 def _panel_gray(rgb):
-    """遊戲提示面板的深灰色（約 44～52，三色幾乎一樣）；用 OpenCV 運算，比 numpy 快。"""
+    """遊戲提示面板的深灰色（截圖約 44～52、Mac 螢幕錄影約 37～41，三色幾乎一樣）；用 OpenCV 運算，比 numpy 快。"""
     import cv2
     import numpy as np
     rgb = np.ascontiguousarray(rgb)
     red, green, blue = cv2.split(rgb)
     spread = cv2.max(cv2.max(cv2.absdiff(red, green), cv2.absdiff(green, blue)), cv2.absdiff(red, blue))
-    in_range = cv2.inRange(rgb, (38, 38, 38), (60, 60, 60))
+    in_range = cv2.inRange(rgb, (30, 30, 30), (60, 60, 60))
     return ((in_range > 0) & (spread <= 8)).astype(np.uint8)
 
 
