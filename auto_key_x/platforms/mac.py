@@ -77,6 +77,25 @@ REQUIRED_PACKAGES_HINT = (
 )
 
 
+# 本檔會在多個執行緒（畫面監看、血量、按鍵攔截、自動重複）用到的 Quartz 名稱。
+# pyobjc 第一次讀到某個名稱時才去載入；兩個執行緒同時第一次讀同一個名稱會 KeyError
+# （實測監看執行緒因此一啟動就停）。所以建立 MacGui 時先在主執行緒全部讀一次。
+QUARTZ_NAMES = (
+    "CFMachPortCreateRunLoopSource", "CFMachPortInvalidate", "CFRunLoopAddSource", "CFRunLoopGetCurrent",
+    "CFRunLoopRemoveSource", "CFRunLoopRunInMode", "CGDataProviderCopyData", "CGDisplayBounds",
+    "CGEventCreate", "CGEventCreateKeyboardEvent", "CGEventGetFlags", "CGEventGetIntegerValueField",
+    "CGEventGetLocation", "CGEventMaskBit", "CGEventPost", "CGEventSetFlags", "CGEventSetIntegerValueField",
+    "CGEventSetType", "CGEventTapCreate", "CGEventTapEnable", "CGImageGetBitsPerPixel",
+    "CGImageGetBytesPerRow", "CGImageGetDataProvider", "CGImageGetHeight", "CGImageGetWidth",
+    "CGMainDisplayID", "CGRectMake", "CGWindowListCopyWindowInfo", "CGWindowListCreateImage",
+    "kCFRunLoopDefaultMode", "kCGEventFlagsChanged", "kCGEventKeyDown", "kCGEventKeyUp",
+    "kCGEventTapDisabledByTimeout", "kCGEventTapDisabledByUserInput", "kCGEventTapOptionDefault",
+    "kCGHIDEventTap", "kCGHeadInsertEventTap", "kCGKeyboardEventAutorepeat", "kCGKeyboardEventKeycode",
+    "kCGNullWindowID", "kCGSessionEventTap", "kCGWindowImageDefault", "kCGWindowListExcludeDesktopElements",
+    "kCGWindowListOptionOnScreenOnly",
+)
+
+
 def _autorelease_pool():
     try:
         import objc
@@ -96,19 +115,22 @@ def foreground_window_handle():
     from AppKit import NSDate, NSDefaultRunLoopMode, NSRunLoop, NSWorkspace
     # 沒處理 run loop 的話，frontmostApplication 會一直停在程式啟動時的 App（POC 實測過）。
     # distantPast＝只處理已到的系統通知、不等待，幾乎不花時間。
-    run_loop = NSRunLoop.currentRunLoop()
-    for _ in range(5):
-        if not run_loop.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.distantPast()):
-            break
-    app = NSWorkspace.sharedWorkspace().frontmostApplication()
-    return int(app.processIdentifier()) if app is not None else None
+    # 主程式每 0.1 秒問一次：系統物件要在 autorelease pool 裡用完，否則一直累積（實測每小時約 12MB）。
+    with _autorelease_pool():
+        run_loop = NSRunLoop.currentRunLoop()
+        for _ in range(5):
+            if not run_loop.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.distantPast()):
+                break
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
 
 
 def get_window_title(handle):
     """Mac 以 App 名稱當作視窗標題（例如「MapleStory Worlds」）。"""
     from AppKit import NSRunningApplication
-    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(handle) if handle else None
-    return (app.localizedName() or "").strip() if app is not None else ""
+    with _autorelease_pool():
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(handle) if handle else None
+        return (app.localizedName() or "").strip() if app is not None else ""
 
 
 def app_window_bounds(pid):
@@ -116,14 +138,16 @@ def app_window_bounds(pid):
     import Quartz
     options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
     best = None
-    for info in Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []:
-        if info.get("kCGWindowOwnerPID") != pid or info.get("kCGWindowLayer", 0) != 0:
-            continue
-        bounds = info.get("kCGWindowBounds") or {}
-        rect = (int(bounds.get("X", 0)), int(bounds.get("Y", 0)),
-                int(bounds.get("Width", 0)), int(bounds.get("Height", 0)))
-        if rect[2] > 0 and rect[3] > 0 and (best is None or rect[2] * rect[3] > best[2] * best[3]):
-            best = rect
+    # 偵測與血量每秒會問十幾次：視窗清單要在 autorelease pool 裡用完（實測不包每小時約 20MB）。
+    with _autorelease_pool():
+        for info in Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []:
+            if info.get("kCGWindowOwnerPID") != pid or info.get("kCGWindowLayer", 0) != 0:
+                continue
+            bounds = info.get("kCGWindowBounds") or {}
+            rect = (int(bounds.get("X", 0)), int(bounds.get("Y", 0)),
+                    int(bounds.get("Width", 0)), int(bounds.get("Height", 0)))
+            if rect[2] > 0 and rect[3] > 0 and (best is None or rect[2] * rect[3] > best[2] * best[3]):
+                best = rect
     return best
 
 
@@ -135,17 +159,18 @@ def find_window_by_title(saved_title):
     normalized_saved = saved_title.casefold()
     exact_matches = []
     partial_matches = []
-    for app in NSWorkspace.sharedWorkspace().runningApplications():
-        name = (app.localizedName() or "").strip()
-        pid = int(app.processIdentifier())
-        if not name or app_window_bounds(pid) is None:
-            continue
-        normalized_name = name.casefold()
-        if normalized_name == normalized_saved:
-            exact_matches.append(pid)
-        elif len(normalized_saved) >= 3 and (
-                normalized_saved in normalized_name or normalized_name in normalized_saved):
-            partial_matches.append(pid)
+    with _autorelease_pool():
+        for app in NSWorkspace.sharedWorkspace().runningApplications():
+            name = (app.localizedName() or "").strip()
+            pid = int(app.processIdentifier())
+            if not name or app_window_bounds(pid) is None:
+                continue
+            normalized_name = name.casefold()
+            if normalized_name == normalized_saved:
+                exact_matches.append(pid)
+            elif len(normalized_saved) >= 3 and (
+                    normalized_saved in normalized_name or normalized_name in normalized_saved):
+                partial_matches.append(pid)
     if exact_matches:
         return exact_matches[0]
     if partial_matches:
@@ -241,6 +266,8 @@ class MacGui:
     def __init__(self, quartz=None, clock=time.monotonic, sleep=time.sleep):
         if quartz is None:
             import Quartz as quartz
+            for name in QUARTZ_NAMES:
+                getattr(quartz, name)  # 先載入，避免多執行緒同時第一次載入而出錯
         self.q = quartz
         self.clock, self.sleep = clock, sleep
         self.lock = threading.Lock()
@@ -435,9 +462,10 @@ class MacHotkeys:
         """最上層的一般視窗屬於遊戲時回傳 True；從 event tap 執行緒呼叫，所以用 Quartz 而不用 NSWorkspace。"""
         q = self.q
         options = q.kCGWindowListOptionOnScreenOnly | q.kCGWindowListExcludeDesktopElements
-        for info in q.CGWindowListCopyWindowInfo(options, q.kCGNullWindowID) or []:
-            if info.get("kCGWindowLayer", 0) == 0:
-                return GAME_APP_KEYWORD.casefold() in str(info.get("kCGWindowOwnerName") or "").casefold()
+        with _autorelease_pool():
+            for info in q.CGWindowListCopyWindowInfo(options, q.kCGNullWindowID) or []:
+                if info.get("kCGWindowLayer", 0) == 0:
+                    return GAME_APP_KEYWORD.casefold() in str(info.get("kCGWindowOwnerName") or "").casefold()
         return False
 
     def callback(self, proxy, event_type, event, refcon):
@@ -463,7 +491,8 @@ class MacHotkeys:
             q.CGEventTapEnable(tap, True)
             self.ready.set()
             while not self.stop_event.is_set():
-                q.CFRunLoopRunInMode(q.kCFRunLoopDefaultMode, 0.1, False)
+                with _autorelease_pool():  # 這個執行緒會跑好幾個小時：每 0.1 秒清一次按鍵事件產生的系統物件
+                    q.CFRunLoopRunInMode(q.kCFRunLoopDefaultMode, 0.1, False)
         except Exception as exc:
             if not self.ready.is_set():
                 self.start_error = f"鍵盤攔截啟動失敗：{exc}"

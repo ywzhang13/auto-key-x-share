@@ -394,9 +394,9 @@ def stage2_scores(image, threshold=GAME_ALERT_THRESHOLD):
     return details, max(details.values(), default=0.0)
 
 
-def _timed(timings, label, function, *args):
+def _timed(timings, label, function, *args, **kwargs):
     started = time.perf_counter()
-    result = function(*args)
+    result = function(*args, **kwargs)
     timings[label] = (time.perf_counter() - started) * 1000
     return result
 
@@ -528,11 +528,12 @@ class ScreenAlert:
                 region = self.region() if callable(self.region) else self.region
                 full_scan = slow is None or curse is None or cycle_started >= min(next_slow, next_curse)
                 if full_scan:
-                    frame = _timed(timings, "截圖", self.gui.screenshot, region)
+                    # region 一定要用關鍵字傳：Windows 的 pyautogui.screenshot 第一個參數是檔名。
+                    frame = _timed(timings, "截圖", self.gui.screenshot, region=region)
                     prepare_area = prep_area(frame)
                 else:
                     # 只看準備面板的輪次：只截右下角，截圖與比對都省一半以上。
-                    prepare_area = _timed(timings, "截圖", self.gui.screenshot, prep_region(region))
+                    prepare_area = _timed(timings, "截圖", self.gui.screenshot, region=prep_region(region))
                 # 第一階段準備面板只顯示 1～2 秒：每輪截圖後第一個看，從出現到暫停 ≤0.3 秒。
                 prepare_details, prepare_score = _timed(timings, "準備畫面", prep_panel_scores, prepare_area)
                 if slow is None or cycle_started >= next_slow:
